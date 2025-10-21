@@ -56,7 +56,6 @@ class DHLiveRealtime:
         
         # 音频参数
         self.sample_rate = 16000
-        self.samples_per_read = int(0.04 * self.sample_rate)
         
         # 音频队列和控制 - 大幅减少队列大小防止内存泄漏
         self.max_queue_size = 3  # 减少到3个，防止音频堆积
@@ -89,6 +88,17 @@ class DHLiveRealtime:
         self.idle_static = False   # 无音频时直接使用 idle 视频
         self.render_output_color = "BGR"  # 渲染模型输出的颜色空间
         
+        # 自适应平滑配置（音频能量驱动）
+        self.ema_prev_mouth = None
+        self.ema_alpha_base = 0.7
+        self.ema_alpha_low = 0.55
+        self.ema_alpha_high = 0.85
+        self.ema_energy_low = 0.01
+        self.ema_energy_high = 0.05
+        
+        # 根据target_fps计算每帧采样数（需在default_silent_chunk之前）
+        self.samples_per_read = int(round(self.sample_rate / self.target_fps))
+        
         # 优化的缓存管理
         self.default_silent_chunk = np.zeros(self.samples_per_read, dtype=np.float32)
         self._cached_idle_mouth = None
@@ -97,8 +107,8 @@ class DHLiveRealtime:
         self._last_metrics_print = time.time()
         
         # 内存管理配置 - 更严格的限制
-        self.gc_interval = 60  # 垃圾回收间隔（秒）- 改为10秒
-        self.memory_check_interval = 30  # 内存检查间隔（秒）- 改为1秒
+        self.gc_interval = 180  # 垃圾回收间隔（秒）
+        self.memory_check_interval = 60  # 内存检查间隔（秒）
         self.max_memory_mb = 1500  # 最大内存使用限制（MB）- 降低到1.5GB
         self.last_memory_check = time.time()
         
@@ -486,7 +496,27 @@ class DHLiveRealtime:
         
         return padded
 
-    
+    def _resample_audio(self, audio: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+        """高保真重采样（优先使用resample_poly，回退到np.interp）。"""
+        try:
+            from scipy.signal import resample_poly
+            import math
+            g = math.gcd(src_rate, dst_rate)
+            up = dst_rate // g
+            down = src_rate // g
+            audio_f32 = audio.astype(np.float32, copy=False)
+            res = resample_poly(audio_f32, up, down)
+            return res.astype(np.float32, copy=False)
+        except Exception:
+            # 回退到线性插值，确保长度匹配且保持浮点精度
+            ratio = float(dst_rate) / float(src_rate)
+            new_length = int(round(len(audio) * ratio))
+            x = np.arange(len(audio), dtype=np.float32)
+            xp = np.linspace(0, len(audio) - 1, new_length, dtype=np.float32)
+            audio_f32 = audio.astype(np.float32, copy=False)
+            res = np.interp(xp, x, audio_f32)
+            return res.astype(np.float32, copy=False)
+
     def process_audio_chunk(self, audio_chunk):
         """处理音频块，生成嘴型帧 - 根本性内存优化版本"""
         try:
@@ -506,6 +536,24 @@ class DHLiveRealtime:
             with torch.no_grad():
                 # 生成嘴型帧
                 mouth_frame = self.audioModel.interface_frame(audio_chunk.astype(np.float32))
+            
+            # 基于块能量的自适应EMA平滑，兼顾响应与顺滑
+            try:
+                energy = float(np.sqrt(np.mean(audio_chunk.astype(np.float32) ** 2)))
+                alpha = self.ema_alpha_base
+                if energy < self.ema_energy_low:
+                    alpha = self.ema_alpha_low
+                elif energy > self.ema_energy_high:
+                    alpha = self.ema_alpha_high
+                if isinstance(mouth_frame, np.ndarray):
+                    if self.ema_prev_mouth is None or getattr(self.ema_prev_mouth, 'shape', None) != getattr(mouth_frame, 'shape', None):
+                        self.ema_prev_mouth = mouth_frame.copy()
+                    else:
+                        mouth_frame = (alpha * mouth_frame + (1.0 - alpha) * self.ema_prev_mouth).astype(mouth_frame.dtype, copy=False)
+                        self.ema_prev_mouth = mouth_frame.copy()
+            except Exception:
+                # 出现异常则跳过平滑，保持原始输出
+                pass
             
             # 立即清理输入数据引用
             del audio_chunk
@@ -573,8 +621,11 @@ class DHLiveRealtime:
             if self.debug:
                 print(f"State change: {self.current_state} -> {target_state}")
             self.current_state = target_state
-            # 开启过渡
-            self._transition_remaining = self.transition_duration_frames
+            # 动态过渡：静默恢复到音频时使用更短的过渡以降低口型滞后
+            if target_state == "audio" and getattr(self, 'was_silent', False):
+                self._transition_remaining = min(3, self.transition_duration_frames)
+            else:
+                self._transition_remaining = self.transition_duration_frames
             # 将过渡起点设为上一帧输出（若存在）
             self._transition_from = self._last_output_frame
             # 在切换到idle时做相位同步，使silent.mp4从与当前时间相匹配的帧开始
@@ -743,16 +794,8 @@ class DHLiveRealtime:
                     # 优化：重采样到目标采样率
                     if sample_rate != self.sample_rate:
                         if self.debug:
-                            print(f"重采样音频: {sample_rate}Hz -> {self.sample_rate}Hz")
-                        # 线性重采样（保持简单高效）
-                        ratio = self.sample_rate / sample_rate
-                        new_length = int(len(audio_data) * ratio)
-                        # 修正边界，避免越界
-                        audio_data = np.interp(
-                            np.linspace(0, len(audio_data) - 1, new_length),
-                            np.arange(len(audio_data)),
-                            audio_data
-                        )
+                            print(f"音频采样率不匹配，重采样 {sample_rate} → {self.sample_rate}")
+                        audio_data = self._resample_audio(audio_data, sample_rate, self.sample_rate)
                     
                     # 分块处理音频
                     chunk_count = 0
