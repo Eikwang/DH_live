@@ -19,6 +19,7 @@ import argparse
 import base64
 import psutil
 import gc
+import torch
 from collections import deque
 import weakref
 from threading import Lock
@@ -84,8 +85,8 @@ class DHLiveRealtime:
         
         # 性能/行为配置
         self.target_fps = 25
-        # 启用静态帧复用以减少CPU和内存使用
-        self.idle_static = True   # 无音频时复用静态帧
+        # 禁用静态帧复用：无音频输入直接播放 idle 视频
+        self.idle_static = False   # 无音频时直接使用 idle 视频
         self.render_output_color = "BGR"  # 渲染模型输出的颜色空间
         
         # 优化的缓存管理
@@ -110,6 +111,7 @@ class DHLiveRealtime:
         self.silence_timeout = 0.1  # s，超过该静默时间切换为idle状态
         self.current_state = "idle"  # idle | audio
         self._last_audio_event_time = 0.0
+        self.was_silent = False
         # 适度增加过渡帧数以更柔和（由6改为10）
         self.transition_duration_frames = 5  # 过渡帧数
         self._transition_remaining = 0
@@ -498,14 +500,7 @@ class DHLiveRealtime:
                     padding = np.zeros(self.samples_per_read - len(audio_chunk))
                     audio_chunk = np.concatenate([audio_chunk, padding])
             
-            # 强制GPU清理 - 推理前
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()  # 强制同步，确保之前的操作完成
-            except ImportError:
-                pass
+
             
             # 使用torch.no_grad()确保不产生梯度，避免内存泄漏
             with torch.no_grad():
@@ -515,25 +510,7 @@ class DHLiveRealtime:
             # 立即清理输入数据引用
             del audio_chunk
             
-            # 强制GPU清理 - 推理后
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-                    # 定期重置GPU内存状态
-                    if hasattr(self, '_gpu_reset_counter'):
-                        self._gpu_reset_counter += 1
-                    else:
-                        self._gpu_reset_counter = 1
-                    
-                    # 每100次推理后执行深度GPU清理
-                    if self._gpu_reset_counter % 100 == 0:
-                        torch.cuda.ipc_collect()  # 清理进程间共享内存
-                        if torch.cuda.is_available():
-                            torch.cuda.reset_peak_memory_stats()  # 重置峰值统计
-            except ImportError:
-                pass
+
             
             return mouth_frame
         except Exception as e:
@@ -541,42 +518,11 @@ class DHLiveRealtime:
             return None
     
     def render_frame(self, mouth_frame):
-        """渲染视频帧 - 根本性内存优化版本"""
         try:
-            # 强制GPU清理 - 渲染前
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-            except ImportError:
-                pass
-            
-            # 使用torch.no_grad()确保不产生梯度
+            import torch
             with torch.no_grad():
                 frame = self.renderModel.interface(mouth_frame)
-            
-            # 立即清理输入数据引用
             del mouth_frame
-            
-            # 强制GPU清理 - 渲染后
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-                    # 定期重置渲染模型的内部状态
-                    if hasattr(self, '_render_reset_counter'):
-                        self._render_reset_counter += 1
-                    else:
-                        self._render_reset_counter = 1
-                    
-                    # 每50次渲染后执行深度清理
-                    if self._render_reset_counter % 50 == 0:
-                        torch.cuda.ipc_collect()
-            except ImportError:
-                pass
-            
             return frame
         except Exception as e:
             print(f"Rendering error: {e}")
@@ -778,6 +724,15 @@ class DHLiveRealtime:
                     self._last_audio_event_time = time.time()
                     with self.state_lock:
                         self._maybe_switch_state("audio")
+                    # 如果刚经历了静默，则重置音频模型隐状态以避免漂移
+                    if getattr(self, 'was_silent', False):
+                        try:
+                            if hasattr(self.audioModel, 'reset'):
+                                self.audioModel.reset()
+                        except Exception as e:
+                            if self.debug:
+                                print(f"音频模型重置失败: {e}")
+                        self.was_silent = False
                 except queue.Empty:
                     has_audio = False
                 
@@ -825,29 +780,12 @@ class DHLiveRealtime:
                         # 清理音频块引用
                         del chunk
                         
-                        # 每处理几个块后执行一次轻度GC和GPU清理
-                        if chunk_count % 3 == 0:  # 改为每3个块清理一次
-                            gc.collect()
-                            try:
-                                import torch
-                                if torch.cuda.is_available():
-                                    torch.cuda.empty_cache()
-                            except ImportError:
-                                pass
+
                     
                     # 清理音频数据引用
                     del audio_data
                     
-                    # 立即执行轻度GC防止内存积累
-                    gc.collect()
-                    
-                    # 清理GPU内存缓存
-                    try:
-                        import torch
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                    except ImportError:
-                        pass
+
                     
                     if self.debug:
                         print(f"音频处理完成，共处理 {chunk_count} 个音频块")
@@ -869,15 +807,15 @@ class DHLiveRealtime:
                                     if idle_frame is not None:
                                         frame_to_send = idle_frame
                                         
-                                if frame_to_send is None:
-                                    frame_to_send = self.render_default_frame()
-                                    
                                 if frame_to_send is not None:
                                     with self.frame_lock:
                                         self.send_with_transition(frame_to_send)
                                     del frame_to_send
                     else:
                         # 切换到idle并播放idle视频
+                        # 标记静默状态以便下次有音频时重置模型
+                        if time.time() - self._last_audio_event_time > self.silence_timeout:
+                            self.was_silent = True
                         with self.state_lock:
                             self._maybe_switch_state("idle")
                         if self.virtual_cam is not None:
@@ -886,10 +824,6 @@ class DHLiveRealtime:
                                 idle_frame = self._read_idle_video_frame()
                                 if idle_frame is not None:
                                     frame_to_send = idle_frame
-                                    
-                            if frame_to_send is None:
-                                frame_to_send = self.render_default_frame()
-                                
                             if frame_to_send is not None:
                                 with self.frame_lock:
                                     self.send_with_transition(frame_to_send)
