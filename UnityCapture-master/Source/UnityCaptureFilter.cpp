@@ -88,7 +88,16 @@ public:
 		m_iUnscaledBufSize = 0;
 		m_pUnscaledBuf = NULL;
 		m_RGBA16Table = NULL;
-		GetMediaType(0, &m_mt);
+		m_pCurrentSample = NULL;
+        GetMediaType(0, &m_mt);
+        int w=0,h=0,s=0; SharedImageMemory::EFormat f;
+        if (m_pReceiver->PeekDimensions(w,h,s,f))
+        {
+            VIDEOINFO *pvi = (VIDEOINFO*)m_mt.Format();
+            pvi->bmiHeader.biWidth = w;
+            pvi->bmiHeader.biHeight = h;
+            pvi->bmiHeader.biSizeImage = DIBSIZE(pvi->bmiHeader);
+        }
 	}
 
 	virtual ~CCaptureStream()
@@ -103,20 +112,27 @@ private:
 	{
 		HRESULT hr;
 		BYTE* pBuf;
-		VIDEOINFO *pvi = (VIDEOINFO*)m_mt.Format();
-		REFERENCE_TIME startTime = m_prevStartTime, endTime = startTime + m_avgTimePerFrame;
+        VIDEOINFO *pvi = (VIDEOINFO*)m_mt.Format();
+        REFERENCE_TIME startTime = m_prevStartTime, endTime = startTime + m_avgTimePerFrame;
 		LONGLONG mtStart = m_llFrame, mtEnd = mtStart + 1;
 		m_prevStartTime = endTime;
 		m_llFrame = mtEnd;
-		UCASSERT(pSamp->GetSize() == pvi->bmiHeader.biSizeImage);
-		UCASSERT(DIBSIZE(pvi->bmiHeader) == pvi->bmiHeader.biSizeImage);
+		m_pCurrentSample = pSamp;
 
-		if (FAILED(hr = pSamp->GetPointer(&pBuf))) return hr;
-		if (FAILED(hr = pSamp->SetActualDataLength(pvi->bmiHeader.biSizeImage))) return hr;
+        if (FAILED(hr = pSamp->GetPointer(&pBuf))) return hr;
+        long cap = pSamp->GetSize();
+        int bpp = pvi->bmiHeader.biBitCount / 8;
+        int needed = pvi->bmiHeader.biWidth * pvi->bmiHeader.biHeight * bpp;
+        int safeHeight = pvi->bmiHeader.biHeight;
+        if (cap > 0 && pvi->bmiHeader.biWidth > 0 && bpp > 0)
+        {
+            int maxRows = cap / (pvi->bmiHeader.biWidth * bpp);
+            if (maxRows > 0 && maxRows < safeHeight) safeHeight = maxRows;
+        }
 		if (FAILED(hr = pSamp->SetTime(&startTime, &endTime))) return hr;
 		if (FAILED(hr = pSamp->SetMediaTime(&mtStart, &mtEnd))) return hr;
 
-		ProcessState State = { pBuf, pvi->bmiHeader.biWidth, pvi->bmiHeader.biHeight, pvi->bmiHeader.biBitCount / 8, this };
+        ProcessState State = { pBuf, pvi->bmiHeader.biWidth, safeHeight, pvi->bmiHeader.biBitCount / 8, this };
 		switch (m_pReceiver->Receive((SharedImageMemory::ReceiveCallbackFunc)ProcessImage, &State))
 		{
 			case SharedImageMemory::RECEIVERES_CAPTUREINACTIVE:{
@@ -139,6 +155,10 @@ private:
 				FillErrorPattern(ErrorDrawModes[EDC_UnitySendingStopped], &State, 1, DisplayStrings, DisplayStringLens, m_llFrame);
 				break;}
 		}
+        pvi = (VIDEOINFO*)m_mt.Format();
+        int actualBytes = pvi->bmiHeader.biWidth * safeHeight * (pvi->bmiHeader.biBitCount/8);
+        if (cap > 0 && actualBytes > cap) actualBytes = cap;
+        if (FAILED(hr = pSamp->SetActualDataLength(actualBytes))) return hr;
 		if (OutputFrameRate) RenderFPSDisplay(&State);
 		return S_OK;
 	}
@@ -513,10 +533,9 @@ private:
 		//Set maximum number of missed frames allowed until we show sending as having stopped
 		State->Owner->m_llFrameMissMax = (Timeout + SharedImageMemory::RECEIVE_MAX_WAIT - 1) / SharedImageMemory::RECEIVE_MAX_WAIT;
 
-		const bool NeedResize = (InWidth != State->BufWidth || InHeight != State->BufHeight);
+		bool NeedResize = (InWidth != State->BufWidth || InHeight != State->BufHeight);
 		if (NeedResize && ResizeMode == SharedImageMemory::RESIZEMODE_DISABLED)
 		{
-			//Show color pattern indicating that the requested resolution does not match the resolution provided by Unity
 			char DisplayString1[128], DisplayString2[128], DisplayString3[128];
 			char* DisplayStrings[] = { DisplayString1, DisplayString2, DisplayString3 };
 			int DisplayStringLens[] = {
@@ -700,27 +719,28 @@ private:
 	STDMETHODIMP Notify(IBaseFilter *pSelf, Quality q) override { return S_OK; }
 	STDMETHODIMP SetSink(IQualityControl *piqc) override { return S_OK; }
 
-	HRESULT DecideBufferSize(IMemAllocator * pAlloc, ALLOCATOR_PROPERTIES * pRequest) override
-	{
-		if (pAlloc == NULL || pRequest == NULL) DebugLog("[DecideBufferSize] E_POINTER\n");
-		if (pAlloc == NULL || pRequest == NULL) return E_POINTER;
-		CAutoLock cAutoLock(m_pFilter->pStateLock());
-		HRESULT hr = NOERROR;
-		VIDEOINFO *pvi = (VIDEOINFO*)m_mt.Format();
-		pRequest->cBuffers = 1;
+    HRESULT DecideBufferSize(IMemAllocator * pAlloc, ALLOCATOR_PROPERTIES * pRequest) override
+    {
+        if (pAlloc == NULL || pRequest == NULL) DebugLog("[DecideBufferSize] E_POINTER\n");
+        if (pAlloc == NULL || pRequest == NULL) return E_POINTER;
+        CAutoLock cAutoLock(m_pFilter->pStateLock());
+        HRESULT hr = NOERROR;
+        VIDEOINFO *pvi = (VIDEOINFO*)m_mt.Format();
+        pRequest->cBuffers = 1;
 
-		DebugLog("[DecideBufferSize] Request Size: %d - Have Size: %d\n", (int)pvi->bmiHeader.biSizeImage, (int)pRequest->cbBuffer);
-		if (pvi->bmiHeader.biSizeImage > (DWORD)pRequest->cbBuffer)
-			pRequest->cbBuffer = pvi->bmiHeader.biSizeImage;
+        int reqSize = DIBSIZE(pvi->bmiHeader);
+        DebugLog("[DecideBufferSize] Request Size: %d - Have Size: %d\n", reqSize, (int)pRequest->cbBuffer);
+        if ((DWORD)reqSize > (DWORD)pRequest->cbBuffer)
+            pRequest->cbBuffer = reqSize;
 
 		ALLOCATOR_PROPERTIES actual;
 		hr = pAlloc->SetProperties(pRequest, &actual);
 		if (FAILED(hr)) DebugLog("[DecideBufferSize] E_SOMETHING\n");
 		if (FAILED(hr)) return hr;
 
-		DebugLog("[DecideBufferSize] Request Size: %d - Actual Size: %d\n", (int)pvi->bmiHeader.biSizeImage, (int)actual.cbBuffer);
-		return (actual.cbBuffer < pRequest->cbBuffer ? E_FAIL : S_OK);
-	}
+        DebugLog("[DecideBufferSize] Request Size: %d - Actual Size: %d\n", reqSize, (int)actual.cbBuffer);
+        return (actual.cbBuffer < pRequest->cbBuffer ? E_FAIL : S_OK);
+    }
 
 	STDMETHODIMP SetFormat(AM_MEDIA_TYPE *pmt) override
 	{
@@ -731,17 +751,13 @@ private:
 		if (pvi == NULL) DebugLog("[SetFormat] E_UNEXPECTED (pvi is null)\n");
 		if (pvi == NULL) return E_UNEXPECTED;
 
-		bool HasStrideBytes = (DIBSIZE(pvi->bmiHeader) != pvi->bmiHeader.biWidth * pvi->bmiHeader.biHeight * pvi->bmiHeader.biBitCount / 8);
-		if (HasStrideBytes) DebugLog("[SetFormat] E_FAIL (has stride bytes)\n");
-		if (HasStrideBytes) return E_FAIL;
-
-		DebugLog("[SetFormat] WIDTH: %d - HEIGHT: %d - BITS: %d - TPS: %d - SIZE: %d - SIZE CALC: %d\n", (int)pvi->bmiHeader.biWidth, (int)pvi->bmiHeader.biHeight, (int)pvi->bmiHeader.biBitCount, (int)pvi->AvgTimePerFrame,
-			(int)pvi->bmiHeader.biSizeImage, (int)DIBSIZE(pvi->bmiHeader));
-		m_avgTimePerFrame = pvi->AvgTimePerFrame;
-		m_mt = *pmt;
-		((VIDEOINFO*)m_mt.pbFormat)->bmiHeader.biSizeImage = DIBSIZE(((VIDEOINFO*)m_mt.pbFormat)->bmiHeader);
-		return S_OK;
-	}
+        DebugLog("[SetFormat] WIDTH: %d - HEIGHT: %d - BITS: %d - TPS: %d - SIZE: %d - SIZE CALC: %d\n", (int)pvi->bmiHeader.biWidth, (int)pvi->bmiHeader.biHeight, (int)pvi->bmiHeader.biBitCount, (int)pvi->AvgTimePerFrame,
+            (int)pvi->bmiHeader.biSizeImage, (int)DIBSIZE(pvi->bmiHeader));
+        m_avgTimePerFrame = pvi->AvgTimePerFrame;
+        m_mt = *pmt;
+        ((VIDEOINFO*)m_mt.pbFormat)->bmiHeader.biSizeImage = DIBSIZE(((VIDEOINFO*)m_mt.pbFormat)->bmiHeader);
+        return S_OK;
+    }
 
 	STDMETHODIMP GetFormat(AM_MEDIA_TYPE **ppmt) override
 	{
@@ -826,12 +842,12 @@ private:
 		}
 		
 		// Check if it's a valid video format
-		if (pMediaType->majortype != MEDIATYPE_Video ||
-			pMediaType->subtype != MEDIASUBTYPE_RGB24 ||
-			pMediaType->formattype != FORMAT_VideoInfo) {
-			DebugLog("[CheckMediaType] Invalid media type format\n");
-			return E_INVALIDARG;
-		}
+        if (pMediaType->majortype != MEDIATYPE_Video ||
+            (pMediaType->subtype != MEDIASUBTYPE_RGB24 && pMediaType->subtype != MEDIASUBTYPE_ARGB32) ||
+            pMediaType->formattype != FORMAT_VideoInfo) {
+            DebugLog("[CheckMediaType] Invalid media type format\n");
+            return E_INVALIDARG;
+        }
 		
 		// Check for reasonable resolution limits
 		int width = pvi->bmiHeader.biWidth;
@@ -842,10 +858,10 @@ private:
 		}
 		
 		// Check bit depth
-		if (pvi->bmiHeader.biBitCount != 24) {
-			DebugLog("[CheckMediaType] Invalid bit count: %d (expected 24)\n", pvi->bmiHeader.biBitCount);
-			return E_INVALIDARG;
-		}
+        if (pvi->bmiHeader.biBitCount != 24 && pvi->bmiHeader.biBitCount != 32) {
+            DebugLog("[CheckMediaType] Invalid bit count: %d\n", pvi->bmiHeader.biBitCount);
+            return E_INVALIDARG;
+        }
 		
 		DebugLog("[CheckMediaType] [WANT] WIDTH: %d - HEIGHT: %d - BITS: %d - TPS: %d - SIZEIMAGE: %d - SIZECALC: %d - CBFORMAT: %d\n", 
 			(int)pvi->bmiHeader.biWidth, (int)pvi->bmiHeader.biHeight, (int)pvi->bmiHeader.biBitCount, 
@@ -855,32 +871,54 @@ private:
 		return S_OK; // Accept any valid custom resolution
 	}
 
-	HRESULT GetMediaType(int iPos, CMediaType *pMediaType) override
+HRESULT GetMediaType(int iPos, CMediaType *pMediaType) override
+{
+	CheckPointer(pMediaType, E_POINTER);
+	if (iPos < 0) return E_INVALIDARG;
+	if (iPos >= (sizeof(_media)/sizeof(_media[0])*2)) return VFW_S_NO_MORE_ITEMS;
+	CAutoLock cAutoLock(m_pFilter->pStateLock()); 
+	int rw=0,rh=0,rs=0; SharedImageMemory::EFormat rf;
+	if (!m_pReceiver->PeekDimensions(rw,rh,rs,rf))
 	{
-		CheckPointer(pMediaType, E_POINTER);
-		if (iPos < 0) return E_INVALIDARG;
-		if (iPos >= (sizeof(_media)/sizeof(_media[0])*2)) return VFW_S_NO_MORE_ITEMS;
-		CAutoLock cAutoLock(m_pFilter->pStateLock()); 
+		for (int i = 0; i < 5 && !m_pReceiver->PeekDimensions(rw,rh,rs,rf); i++) Sleep(SharedImageMemory::RECEIVE_MAX_WAIT);
+	}
+    if (rw > 0 && rh > 0)
+    {
+        VIDEOINFO* pviCur = (VIDEOINFO*)m_mt.AllocFormatBuffer(sizeof(VIDEOINFO));
+        ZeroMemory(pviCur, sizeof(VIDEOINFO));
+        pviCur->AvgTimePerFrame = m_avgTimePerFrame;
+        BITMAPINFOHEADER *pBmiCur = &(pviCur->bmiHeader);
+        pBmiCur->biSize = sizeof(BITMAPINFOHEADER);
+        pBmiCur->biWidth = rw;
+        pBmiCur->biHeight = rh;
+        pBmiCur->biPlanes = 1;
+        pBmiCur->biBitCount = 32;
+        pBmiCur->biCompression = BI_RGB;
+        pviCur->bmiHeader.biSizeImage = DIBSIZE(pviCur->bmiHeader);
+    }
 
-		int iMedia = iPos%(sizeof(_media)/sizeof(_media[0]));
-		UCASSERT(_media[iMedia].width * _media[iMedia].height * 4 * sizeof(short) <= MAX_SHARED_IMAGE_SIZE);
-		VIDEOINFO *pvi = (VIDEOINFO *)pMediaType->AllocFormatBuffer(sizeof(VIDEOINFO));
-		ZeroMemory(pvi, sizeof(VIDEOINFO));
-		pvi->AvgTimePerFrame = m_avgTimePerFrame;
-		BITMAPINFOHEADER *pBmi = &(pvi->bmiHeader);
-		pBmi->biSize = sizeof(BITMAPINFOHEADER);
-		pBmi->biWidth  = (_media[iMedia].width  ? _media[iMedia].width  : ((VIDEOINFO*)m_mt.pbFormat)->bmiHeader.biWidth );
-		pBmi->biHeight = (_media[iMedia].height ? _media[iMedia].height : ((VIDEOINFO*)m_mt.pbFormat)->bmiHeader.biHeight);
-		pBmi->biPlanes = 1;
-		pBmi->biBitCount = (iPos >= (sizeof(_media)/sizeof(_media[0])) ? 32 : 24);
-		pBmi->biCompression = BI_RGB;
-		pvi->bmiHeader.biSizeImage = DIBSIZE(pvi->bmiHeader);
+	int iMedia = iPos%(sizeof(_media)/sizeof(_media[0]));
+	UCASSERT(_media[iMedia].width * _media[iMedia].height * 4 * sizeof(short) <= MAX_SHARED_IMAGE_SIZE);
+	VIDEOINFO *pvi = (VIDEOINFO *)pMediaType->AllocFormatBuffer(sizeof(VIDEOINFO));
+	ZeroMemory(pvi, sizeof(VIDEOINFO));
+	pvi->AvgTimePerFrame = m_avgTimePerFrame;
+	BITMAPINFOHEADER *pBmi = &(pvi->bmiHeader);
+	pBmi->biSize = sizeof(BITMAPINFOHEADER);
+    pBmi->biWidth  = (_media[iMedia].width  ? _media[iMedia].width  : ((VIDEOINFO*)m_mt.pbFormat)->bmiHeader.biWidth );
+    pBmi->biHeight = (_media[iMedia].height ? _media[iMedia].height : ((VIDEOINFO*)m_mt.pbFormat)->bmiHeader.biHeight);
+    pBmi->biPlanes = 1;
+    {
+        int num = (int)(sizeof(_media)/sizeof(_media[0]));
+        pBmi->biBitCount = (iPos < num ? 32 : 24);
+    }
+    pBmi->biCompression = BI_RGB;
+    pvi->bmiHeader.biSizeImage = DIBSIZE(pvi->bmiHeader);
 
 		//DebugLog("[GetMediaType] iPos: %d - WIDTH: %d - HEIGHT: %d - BITS: %d - TPS: %d\n", iPos, (int)pvi->bmiHeader.biWidth, (int)pvi->bmiHeader.biHeight, (int)pvi->bmiHeader.biBitCount, (int)pvi->AvgTimePerFrame);
 
 		pMediaType->SetType(&MEDIATYPE_Video);
 		pMediaType->SetFormatType(&FORMAT_VideoInfo);
-		pMediaType->SetSubtype(&(pBmi->biBitCount == 32 ? MEDIASUBTYPE_ARGB32 : MEDIASUBTYPE_RGB24));
+    pMediaType->SetSubtype(&(pBmi->biBitCount == 32 ? MEDIASUBTYPE_ARGB32 : MEDIASUBTYPE_RGB24));
 		pMediaType->SetSampleSize(pvi->bmiHeader.biSizeImage);
 		pMediaType->SetTemporalCompression(FALSE);
 		return S_OK;
@@ -902,6 +940,7 @@ private:
 	ProcessWorkers m_ProcessWorkers;
 	DWORD m_iUnscaledBufSize;
 	uint8_t *m_pUnscaledBuf, *m_RGBA16Table;
+	IMediaSample* m_pCurrentSample;
 	SharedImageMemory::EFormat m_RGBA16TableFormat;
 
 	//IAMStreamControl

@@ -61,6 +61,18 @@ struct SharedImageMemory
 		return (IsNewFrame ? RECEIVERES_NEWFRAME : RECEIVERES_OLDFRAME);
 	}
 
+	bool PeekDimensions(int& outWidth, int& outHeight, int& outStride, EFormat& outFormat)
+	{
+		if (!Open(true) || !m_pSharedBuf) return false;
+		WaitForSingleObject(m_hMutex, INFINITE);
+		outWidth = m_pSharedBuf->width;
+		outHeight = m_pSharedBuf->height;
+		outStride = m_pSharedBuf->stride;
+		outFormat = (EFormat)m_pSharedBuf->format;
+		ReleaseMutex(m_hMutex);
+		return (outWidth > 0 && outHeight > 0);
+	}
+
 	bool SendIsReady()
 	{
 		return Open(false);

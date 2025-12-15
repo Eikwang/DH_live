@@ -35,7 +35,7 @@ if __name__ == "__main__":
     opt.source_channel = 3 * 2
     opt.target_channel = 3
     opt.ref_channel = n_ref * 3 * 2
-    opt.batch_size = 4
+    opt.batch_size = 12
     opt.result_path = "checkpoint/Dinet_five_ref"
     opt.resume = False
     opt.resume_path = None

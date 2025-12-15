@@ -92,7 +92,8 @@ if __name__ == "__main__":
 
     train_log_path = os.path.join("checkpoint/{}/log".format("DiNet_five_ref"), "train")
     os.makedirs(train_log_path, exist_ok=True)
-    train_logger = SummaryWriter(train_log_path)
+    train_logger = SummaryWriter(train_log_path, max_queue=1, flush_secs=1)
+    tb_enabled = True
 
     # start train
     for epoch in range(opt.start_epoch, opt.non_decay + opt.decay + 1):
@@ -162,24 +163,48 @@ if __name__ == "__main__":
                 inference_out = np.concatenate([inference_in, inference_in_prompt, inference_out, frame2, frame3], axis=1)
                 inference_out = cv2.cvtColor(inference_out, cv2.COLOR_RGB2BGR)
 
-                log(train_logger, fig=inference_out, tag="Training/epoch_{}_{}".format(epoch, iteration))
+                if tb_enabled:
+                    try:
+                        log(train_logger, fig=inference_out, tag="Training/epoch_{}_{}".format(epoch, iteration))
+                    except Exception:
+                        try:
+                            train_logger.close()
+                        except Exception:
+                            pass
+                        tb_enabled = False
 
                 real_iteration = epoch * len(training_data_loader) + iteration
                 message1 = "Step {}/{}, ".format(real_iteration, (epoch + 1) * len(training_data_loader))
                 message2 = ""
                 losses = [loss_dI.item(), loss_g_perception.item(), loss_g_dI.item()]
-                train_logger.add_scalar("Loss/loss_dI", losses[0], real_iteration)
-                train_logger.add_scalar("Loss/loss_g_perception", losses[1], real_iteration)
-                train_logger.add_scalar("Loss/loss_g_dI", losses[2], real_iteration)
+                if tb_enabled:
+                    try:
+                        train_logger.add_scalar("Loss/loss_dI", losses[0], real_iteration)
+                        train_logger.add_scalar("Loss/loss_g_perception", losses[1], real_iteration)
+                        train_logger.add_scalar("Loss/loss_g_dI", losses[2], real_iteration)
+                    except Exception:
+                        try:
+                            train_logger.close()
+                        except Exception:
+                            pass
+                        tb_enabled = False
 
             avg_loss_g_perception += loss_g_perception.item()
             avg_Loss_DI += loss_dI.item()
             avg_Loss_GI += loss_g_dI.item()
-        train_logger.add_scalar("Loss/{}".format("epoch_g_perception"), avg_loss_g_perception / len(training_data_loader), epoch)
-        train_logger.add_scalar("Loss/{}".format("epoch_DI"),
-                                avg_Loss_DI / len(training_data_loader), epoch)
-        train_logger.add_scalar("Loss/{}".format("epoch_GI"),
-                                avg_Loss_GI / len(training_data_loader), epoch)
+        if tb_enabled:
+            try:
+                train_logger.add_scalar("Loss/{}".format("epoch_g_perception"), avg_loss_g_perception / len(training_data_loader), epoch)
+                train_logger.add_scalar("Loss/{}".format("epoch_DI"),
+                                        avg_Loss_DI / len(training_data_loader), epoch)
+                train_logger.add_scalar("Loss/{}".format("epoch_GI"),
+                                        avg_Loss_GI / len(training_data_loader), epoch)
+            except Exception:
+                try:
+                    train_logger.close()
+                except Exception:
+                    pass
+                tb_enabled = False
         update_learning_rate(net_g_scheduler, optimizer_g)
         update_learning_rate(net_d_scheduler, optimizer_d)
 

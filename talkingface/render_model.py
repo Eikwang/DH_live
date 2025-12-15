@@ -90,11 +90,12 @@ class RenderModel:
 
         coords_array = coords_array*np.array([x_max - x_min, y_max - y_min, z_max - z_min, 1]) + np.array([x_min, y_min, z_min, 0])
         self.__mouth_coords_array = coords_array.reshape(-1, 4).transpose(1, 0)
+        self.frame_index = 0
 
 
 
     def interface(self, mouth_frame):
-        vid_frame_count = self.__cap_input.get(cv2.CAP_PROP_FRAME_COUNT)
+        vid_frame_count = int(self.__cap_input.get(cv2.CAP_PROP_FRAME_COUNT))
         if self.frame_index % vid_frame_count == 0:
             self.__cap_input.set(cv2.CAP_PROP_POS_FRAMES, 0)  # 设置要获取的帧号
         ret, frame = self.__cap_input.read()  # 按帧读取视频
@@ -131,6 +132,19 @@ class RenderModel:
         img_bg[y_min:y_max, x_min:x_max] = img_face
         self.frame_index += 1
         return img_bg
+
+    def seek_frame(self, idx):
+        try:
+            if self.__cap_input is None:
+                self.frame_index = int(idx)
+                return
+            vid_frame_count = int(self.__cap_input.get(cv2.CAP_PROP_FRAME_COUNT))
+            if vid_frame_count > 0:
+                pos = int(idx) % vid_frame_count
+                self.__cap_input.set(cv2.CAP_PROP_POS_FRAMES, pos)
+            self.frame_index = int(idx)
+        except Exception:
+            self.frame_index = int(idx)
 
     def save(self, path):
         torch.save(self.__net.state_dict(), path)

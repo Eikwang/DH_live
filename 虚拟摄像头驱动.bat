@@ -14,5 +14,5 @@ set HF_ENDPOINT=https://hf-mirror.com
 set HF_HOME=%CD%\hf_download
 @REM set CUDA_VISIBLE_DEVICES=0
 @REM set PYTHONPATH=third_party/AcademiCodec;third_party/Matcha-TTS
-"%PYTHON_EXECUTABLE%" dh_live_realtime.py --character CL2 --render_model checkpoint/CL2.pth --audio_model checkpoint/audio.pkl --host 0.0.0.0 --port 8051
+"%PYTHON_EXECUTABLE%" dh_live_realtime.py --character dw --render_model checkpoint/10w.pth --audio_model checkpoint/audio.pkl --host 0.0.0.0 --port 8051
 pause

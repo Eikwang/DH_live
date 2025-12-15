@@ -38,6 +38,10 @@ class DHLiveRealtime:
         pkl_path = "video_data/{}/keypoint_rotate.pkl".format(character)
         self.video_path = "video_data/{}/circle.mp4".format(character)
         self.renderModel.reset_charactor(self.video_path, pkl_path)
+        cap_main = cv2.VideoCapture(self.video_path)
+        self.main_video_frame_count = int(cap_main.get(cv2.CAP_PROP_FRAME_COUNT)) if cap_main.isOpened() else 0
+        if cap_main is not None:
+            cap_main.release()
         
         # 动态获取角色视频的实际尺寸
         self.video_width, self.video_height = self.get_video_dimensions(self.video_path)
@@ -58,7 +62,7 @@ class DHLiveRealtime:
         self.sample_rate = 16000
         
         # 音频队列和控制 - 大幅减少队列大小防止内存泄漏
-        self.max_queue_size = 3  # 减少到3个，防止音频堆积
+        self.max_queue_size = 5
         self.audio_queue = queue.Queue(maxsize=self.max_queue_size)
         self.is_running = False
         self.virtual_cam = None
@@ -85,7 +89,7 @@ class DHLiveRealtime:
         # 性能/行为配置
         self.target_fps = 25
         # 禁用静态帧复用：无音频输入直接播放 idle 视频
-        self.idle_static = False   # 无音频时直接使用 idle 视频
+        self.idle_static = True   # 无音频时直接使用 idle 视频
         self.render_output_color = "BGR"  # 渲染模型输出的颜色空间
         
         # 自适应平滑配置（音频能量驱动）
@@ -129,11 +133,13 @@ class DHLiveRealtime:
         self._last_output_frame = None  # 最近一次输出的帧（BGR，已按目标尺寸）
         # 引入统一时间轴，用于idle视频相位对齐
         self.timeline_start_time = time.time()
+        self.global_frame_index = 0
         
         self.idle_video_cap = None
         self.idle_video_fps = None
         self.idle_video_frame_count = 0
         self._idle_video_enabled = False
+        self.idle_current_index = 0
         
         # 预分配的帧缓冲区
         self._preallocated_frames = {}
@@ -311,7 +317,7 @@ class DHLiveRealtime:
 
     def _read_idle_video_frame(self):
         try:
-            if not self._idle_video_enabled or self.idle_video_cap is None:
+            if not self._idle_video_enabled or self.idle_video_cap is None or self.idle_video_frame_count <= 0:
                 return None
             ret, frame = self.idle_video_cap.read()
             if not ret:
@@ -604,11 +610,9 @@ class DHLiveRealtime:
         try:
             if not self._idle_video_enabled or self.idle_video_cap is None or self.idle_video_frame_count <= 0:
                 return
-            elapsed = time.time() - self.timeline_start_time
-            # 按目标FPS计算期望帧索引，并对齐至视频总帧数
-            idx = int(round(elapsed * self.target_fps)) % self.idle_video_frame_count
-            # 定位到对应帧（注意某些解码器可能只保证关键帧附近准确）
+            idx = int(self.global_frame_index) % self.idle_video_frame_count
             self.idle_video_cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            self.idle_current_index = idx
         except Exception as e:
             if self.debug:
                 print(f"Idle video sync error: {e}")
@@ -631,6 +635,11 @@ class DHLiveRealtime:
             # 在切换到idle时做相位同步，使silent.mp4从与当前时间相匹配的帧开始
             if target_state == "idle":
                 self._sync_idle_video_to_now()
+            else:
+                try:
+                    self.renderModel.seek_frame(int(self.global_frame_index))
+                except Exception:
+                    pass
 
     def send_frame_to_camera(self, frame):
         """优化的帧发送方法，深度减少内存泄漏"""
@@ -814,7 +823,7 @@ class DHLiveRealtime:
                                 # 发送帧到虚拟摄像头（带过渡）
                                 with self.frame_lock:
                                     self.send_with_transition(frame)
-                                # 立即释放帧引用
+                                self.global_frame_index += 1
                                 del frame
                             
                             # 清理中间变量
@@ -841,6 +850,7 @@ class DHLiveRealtime:
                         if self._last_output_frame is not None and self.virtual_cam is not None:
                             with self.frame_lock:
                                 self.send_with_transition(self._last_output_frame)
+                            self.global_frame_index += 1
                         else:
                             # 尝试播放空闲视频（若可用），否则渲染默认帧
                             if self.virtual_cam is not None:
@@ -853,7 +863,7 @@ class DHLiveRealtime:
                                 if frame_to_send is not None:
                                     with self.frame_lock:
                                         self.send_with_transition(frame_to_send)
-                                    del frame_to_send
+                                    self.global_frame_index += 1
                     else:
                         # 切换到idle并播放idle视频
                         # 标记静默状态以便下次有音频时重置模型
@@ -870,7 +880,7 @@ class DHLiveRealtime:
                             if frame_to_send is not None:
                                 with self.frame_lock:
                                     self.send_with_transition(frame_to_send)
-                                del frame_to_send
+                                self.global_frame_index += 1
                 
                 # 记录处理时间
                 processing_time = time.time() - start_time

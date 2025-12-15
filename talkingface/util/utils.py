@@ -22,7 +22,7 @@ def get_scheduler(optimizer, niter, niter_decay, lr_policy='cosine', lr_decay_it
     elif lr_policy == 'cosine':
         def lambda_rule(epoch):
             total_fixed_plus_warmup = niter
-            warmup_epochs = max(1000, total_fixed_plus_warmup // 6)
+            warmup_epochs = max(1000, total_fixed_plus_warmup // 10)
             fixed_end_epoch = total_fixed_plus_warmup 
 
             if epoch < warmup_epochs:
@@ -48,8 +48,11 @@ def get_scheduler(optimizer, niter, niter_decay, lr_policy='cosine', lr_decay_it
 
     return scheduler
 
-def update_learning_rate(scheduler, optimizer):
-    scheduler.step()
+def update_learning_rate(scheduler, optimizer, metric=None):
+    if isinstance(scheduler, lr_scheduler.ReduceLROnPlateau):
+        scheduler.step(metric)
+    else:
+        scheduler.step()
     lr = optimizer.param_groups[0]['lr']
     print('learning rate = %.7f' % lr)
 
@@ -104,10 +107,12 @@ def ExtractFaceFromFrameList(frames_list, vid_height, vid_width, out_size = 256)
         for index, frame in tqdm.tqdm(enumerate(frames_list)):
             results = face_mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             if not results.multi_face_landmarks:
-                print("****** WARNING! No face detected! ******")
-                pts_3d[index] = 0
-                return
-                # continue
+                print(f"Warning: No face in frame {index}")
+                if index == 0:
+                    pts_3d[index] = np.zeros((478, 3))
+                else:
+                    pts_3d[index] = pts_3d[index - 1].copy()
+                continue
             image_height, image_width = frame.shape[:2]
             for face_landmarks in results.multi_face_landmarks:
                 for index_, i in enumerate(face_landmarks.landmark):

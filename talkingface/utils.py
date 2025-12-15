@@ -75,6 +75,40 @@ def crop_face(keypoints, is_train = False, size = [512, 512]):
     return [x_min, y_min, x_max, y_max]
 
 def draw_face_feature_maps(keypoints, mode = ["mouth", "nose", "eye", "oval"], size=(256, 256), im_edges = None,  mouth_width = None, mouth_height = None):
+    keypoints = np.asarray(keypoints)
+    if keypoints.ndim == 0:
+        return np.zeros((size[1], size[0], 3), np.uint8) if im_edges is None else im_edges
+    if keypoints.ndim == 1:
+        if keypoints.size % 2 != 0:
+            return np.zeros((size[1], size[0], 3), np.uint8) if im_edges is None else im_edges
+        keypoints = keypoints.reshape(-1, 2)
+    if keypoints.ndim != 2:
+        return np.zeros((size[1], size[0], 3), np.uint8) if im_edges is None else im_edges
+    if keypoints.shape[1] < 2:
+        return np.zeros((size[1], size[0], 3), np.uint8) if im_edges is None else im_edges
+    keypoints = keypoints[:, :2]
+    def _pt(idx):
+        try:
+            i = int(idx)
+        except Exception:
+            return None
+        if i < 0 or i >= keypoints.shape[0]:
+            return None
+        row = np.asarray(keypoints[i])
+        if row.ndim == 0 or row.size < 2:
+            return None
+        # 确保坐标值是有效的数字且在合理范围内
+        try:
+            x = float(row[0])
+            y = float(row[1])
+            if not (np.isfinite(x) and np.isfinite(y)):
+                return None
+            # 确保坐标在图像范围内（加上一些缓冲）
+            if x < -w * 0.1 or x > w * 1.1 or y < -h * 0.1 or y > h * 1.1:
+                return None
+            return (int(x), int(y))
+        except (ValueError, TypeError):
+            return None
     w, h = size
     # edge map for face region from keypoints
     if im_edges is None:
@@ -133,33 +167,39 @@ def draw_face_feature_maps(keypoints, mode = ["mouth", "nose", "eye", "oval"], s
         im_edges = output
     if "nose" in mode:
         for ii in range(len(INDEX_NOSE_EDGE) - 1):
-            pt1 = [int(flt) for flt in keypoints[INDEX_NOSE_EDGE[ii]]][:2]
-            pt2 = [int(flt) for flt in keypoints[INDEX_NOSE_EDGE[ii+1]]][:2]
-            cv2.line(im_edges, tuple(pt1), tuple(pt2), (0, 255, 0), 2)
-        for ii in range(len(INDEX_NOSE_MID) -1):
-            pt1 = [int(flt) for flt in keypoints[INDEX_NOSE_MID[ii]]][:2]
-            pt2 = [int(flt) for flt in keypoints[INDEX_NOSE_MID[ii + 1]]][:2]
-            cv2.line(im_edges, tuple(pt1), tuple(pt2), (0, 255, 0), 2)
+            p1 = _pt(INDEX_NOSE_EDGE[ii])
+            p2 = _pt(INDEX_NOSE_EDGE[ii + 1])
+            if p1 is not None and p2 is not None:
+                cv2.line(im_edges, p1, p2, (0, 255, 0), 2)
+        for ii in range(len(INDEX_NOSE_MID) - 1):
+            p1 = _pt(INDEX_NOSE_MID[ii])
+            p2 = _pt(INDEX_NOSE_MID[ii + 1])
+            if p1 is not None and p2 is not None:
+                cv2.line(im_edges, p1, p2, (0, 255, 0), 2)
     if "eye" in mode:
         for ii in range(len(INDEX_LEFT_EYE)):
-            pt1 = [int(flt) for flt in keypoints[INDEX_LEFT_EYE[ii]]][:2]
-            pt2 = [int(flt) for flt in keypoints[INDEX_LEFT_EYE[(ii + 1)%len(INDEX_LEFT_EYE)]]][:2]
-            cv2.line(im_edges, tuple(pt1), tuple(pt2), (0, 255, 0), 2)
+            p1 = _pt(INDEX_LEFT_EYE[ii])
+            p2 = _pt(INDEX_LEFT_EYE[(ii + 1) % len(INDEX_LEFT_EYE)])
+            if p1 is not None and p2 is not None:
+                cv2.line(im_edges, p1, p2, (0, 255, 0), 2)
         for ii in range(len(INDEX_RIGHT_EYE)):
-            pt1 = [int(flt) for flt in keypoints[INDEX_RIGHT_EYE[ii]]][:2]
-            pt2 = [int(flt) for flt in keypoints[INDEX_RIGHT_EYE[(ii + 1) % len(INDEX_RIGHT_EYE)]]][:2]
-            cv2.line(im_edges, tuple(pt1), tuple(pt2), (0, 255, 0), 2)
+            p1 = _pt(INDEX_RIGHT_EYE[ii])
+            p2 = _pt(INDEX_RIGHT_EYE[(ii + 1) % len(INDEX_RIGHT_EYE)])
+            if p1 is not None and p2 is not None:
+                cv2.line(im_edges, p1, p2, (0, 255, 0), 2)
     if "oval" in mode:
-        tmp =  INDEX_FACE_OVAL[:6]
-        for ii in range(len(tmp) -1):
-            pt1 = [int(flt) for flt in keypoints[tmp[ii]]][:2]
-            pt2 = [int(flt) for flt in keypoints[tmp[ii + 1]]][:2]
-            cv2.line(im_edges, tuple(pt1), tuple(pt2), (0, 0, 255), 2)
+        tmp = INDEX_FACE_OVAL[:6]
+        for ii in range(len(tmp) - 1):
+            p1 = _pt(tmp[ii])
+            p2 = _pt(tmp[ii + 1])
+            if p1 is not None and p2 is not None:
+                cv2.line(im_edges, p1, p2, (0, 0, 255), 2)
         tmp = INDEX_FACE_OVAL[-6:]
         for ii in range(len(tmp) - 1):
-            pt1 = [int(flt) for flt in keypoints[tmp[ii]]][:2]
-            pt2 = [int(flt) for flt in keypoints[tmp[ii + 1]]][:2]
-            cv2.line(im_edges, tuple(pt1), tuple(pt2), (0, 0, 255), 2)
+            p1 = _pt(tmp[ii])
+            p2 = _pt(tmp[ii + 1])
+            if p1 is not None and p2 is not None:
+                cv2.line(im_edges, p1, p2, (0, 0, 255), 2)
 
     # if "mouth_outer" in mode:
     #     pts = keypoints[INDEX_LIPS_OUTER]
@@ -182,25 +222,29 @@ def draw_face_feature_maps(keypoints, mode = ["mouth", "nose", "eye", "oval"], s
 
     if "mouth" in mode:
         for ii in range(len(INDEX_LIPS_OUTER)):
-            pt1 = [int(flt) for flt in keypoints[INDEX_LIPS_OUTER[ii]]][:2]
-            pt2 = [int(flt) for flt in keypoints[INDEX_LIPS_OUTER[(ii + 1)%len(INDEX_LIPS_OUTER)]]][:2]
-            cv2.line(im_edges, tuple(pt1), tuple(pt2), (255, 0, 0), 2)
+            p1 = _pt(INDEX_LIPS_OUTER[ii])
+            p2 = _pt(INDEX_LIPS_OUTER[(ii + 1) % len(INDEX_LIPS_OUTER)])
+            if p1 is not None and p2 is not None:
+                cv2.line(im_edges, p1, p2, (255, 0, 0), 2)
         for ii in range(len(INDEX_LIPS_INNER)):
-            pt1 = [int(flt) for flt in keypoints[INDEX_LIPS_INNER[ii]]][:2]
-            pt2 = [int(flt) for flt in keypoints[INDEX_LIPS_INNER[(ii + 1)%len(INDEX_LIPS_INNER)]]][:2]
-            cv2.line(im_edges, tuple(pt1), tuple(pt2), (255, 0, 0), 2)
+            p1 = _pt(INDEX_LIPS_INNER[ii])
+            p2 = _pt(INDEX_LIPS_INNER[(ii + 1) % len(INDEX_LIPS_INNER)])
+            if p1 is not None and p2 is not None:
+                cv2.line(im_edges, p1, p2, (255, 0, 0), 2)
     if "muscle" in mode:
         for ii in range(len(INDEX_MUSCLE) - 1):
-            pt1 = [int(flt) for flt in keypoints[INDEX_MUSCLE[ii]]][:2]
-            pt2 = [int(flt) for flt in keypoints[INDEX_MUSCLE[(ii + 1) % len(INDEX_MUSCLE)]]][:2]
-            cv2.line(im_edges, tuple(pt1), tuple(pt2), (255, 255, 255), 2)
+            p1 = _pt(INDEX_MUSCLE[ii])
+            p2 = _pt(INDEX_MUSCLE[(ii + 1) % len(INDEX_MUSCLE)])
+            if p1 is not None and p2 is not None:
+                cv2.line(im_edges, p1, p2, (255, 255, 255), 2)
 
     if "oval_all" in mode:
-        tmp =  INDEX_FACE_OVAL
-        for ii in range(len(tmp) -1):
-            pt1 = [int(flt) for flt in keypoints[tmp[ii]]][:2]
-            pt2 = [int(flt) for flt in keypoints[tmp[ii + 1]]][:2]
-            cv2.line(im_edges, tuple(pt1), tuple(pt2), (0, 0, 255), 2)
+        tmp = INDEX_FACE_OVAL
+        for ii in range(len(tmp) - 1):
+            p1 = _pt(tmp[ii])
+            p2 = _pt(tmp[ii + 1])
+            if p1 is not None and p2 is not None:
+                cv2.line(im_edges, p1, p2, (0, 0, 255), 2)
 
     return im_edges
 
